@@ -20,10 +20,24 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
+import "time"
+import "math/rand"
 
 // import "bytes"
 // import "../labgob"
 
+type Role int
+
+const (
+	Follower   Role = 0
+	Candidate  Role = 1
+	Leader     Role = 2
+)
+
+const (
+	ElectionTimeout  = time.Millisecond * 300
+	HeartBeatTimeout = time.Millisecond * 100
+)
 
 
 //
@@ -43,6 +57,10 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Term 	int
+	Command interface{}
+}
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,7 +74,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm   int
+	votedFor	  int
+	log[]		  []LogEntry
+	role 		  Role
 
+	electionTimer *time.Timer
+	pingTimer 	  *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -66,6 +90,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = (rf.role == Leader)
 	return term, isleader
 }
 
@@ -117,6 +145,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term 	        int
+	CandidateId    int
+	LastLogIndex	int
+	LastLogTerm		int
 }
 
 //
@@ -125,6 +157,19 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term		int
+	VoteGranted bool
+}
+
+
+type AppendEntriesArgs struct {
+	Term 		int
+	LeaderId	int
+}
+
+type AppendEntriesReply struct {
+	Term		int
+	Success 	bool
 }
 
 //
@@ -132,6 +177,39 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	// 需要严格遵循论文中的requestVote要求
+	/*
+		1. 当任期小于或者已投票时不做修改（任期小于时candidate要降为follower）
+		2. 当任期大于时变为follower（重置选票和任期）
+		3. 接下来如果可以投票就投
+	*/
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
+		reply.VoteGranted = false
+	} else {
+		if args.Term > rf.currentTerm {
+			rf.becomeFollower(args.Term)
+		} else {
+			rf.electionTimer.Reset(getRandElectTimeout())
+		}
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		
+	}
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	if args.Term >= rf.currentTerm {
+		rf.becomeFollower(args.Term)
+		reply.Success = true
+	} else {
+		reply.Success = false
+	}
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
 }
 
 //
@@ -165,6 +243,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -228,16 +311,145 @@ func (rf *Raft) killed() bool {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		peers:			peers,
+		persister:		persister,
+		me:				me,
+		role:			Follower,
+		currentTerm:	0,
+		votedFor:		-1,
+		electionTimer:  time.NewTimer(getRandElectTimeout()),
+		pingTimer:		time.NewTimer(HeartBeatTimeout),
+	}
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	go rf.electionLoop()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-
+	
 	return rf
+}
+
+
+// user defined function
+func getRandElectTimeout() time.Duration {
+	r := time.Duration(rand.Int63()) % ElectionTimeout
+	return r + ElectionTimeout
+}
+
+func (rf *Raft) becomeFollower(term int) {
+	rf.role = Follower
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.electionTimer.Reset(getRandElectTimeout())
+	DPrintf("Raft %d becomes follower with term %d\n", rf.me, term)
+}
+
+func (rf *Raft) becomeCandidate() {
+	rf.currentTerm += 1
+	rf.role = Candidate
+	rf.votedFor = rf.me
+	DPrintf("Raft %d becomes candidate with term %d\n", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.role = Leader
+	DPrintf("Raft %d becomes leader with term %d\n", rf.me, rf.currentTerm)
+	go rf.pingLoop()
+}
+
+func (rf *Raft) electionLoop() {
+	for !rf.killed() {
+		<- rf.electionTimer.C
+		rf.mu.Lock()
+		rf.electionTimer.Reset(getRandElectTimeout())
+		rf.mu.Unlock()
+		rf.startElection()
+	}
+}
+
+func (rf *Raft) pingLoop() {
+	rf.pingTimer.Reset(HeartBeatTimeout)
+	for {
+		_, isLeader := rf.GetState()
+		if !isLeader {
+			return
+		}
+		<- rf.pingTimer.C
+		rf.startHeartBeat()
+		rf.mu.Lock()
+		rf.pingTimer.Reset(HeartBeatTimeout)
+		rf.mu.Unlock()
+		DPrintf("Raft %d start next ping round\n", rf.me)
+	}
+}
+
+func (rf *Raft) startHeartBeat() {
+	rf.mu.Lock()
+	term := rf.currentTerm
+	DPrintf("Raft %d start heartbeat in term %d\n", rf.me, term)
+	args := AppendEntriesArgs{
+		Term:     term,
+		LeaderId: rf.me,
+	}
+	rf.mu.Unlock()
+	for i := range rf.peers {
+		if i != rf.me {
+			go func (i int)  {
+				reply := AppendEntriesReply{}
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				rf.mu.Lock()
+				if ok {
+					if reply.Term > rf.currentTerm {
+						rf.becomeFollower(reply.Term)
+					} else {
+						rf.electionTimer.Reset(getRandElectTimeout())
+					}
+				}
+				rf.mu.Unlock()
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) startElection() {
+	DPrintf("Raft %d election timeout\n", rf.me)
+	_, isLeader := rf.GetState()
+	if isLeader {
+		DPrintf("Raft %d is already the leader, skip elction\n", rf.me)
+		return
+	}
+	rf.mu.Lock()
+	rf.becomeCandidate()
+	args := RequestVoteArgs{
+		Term: rf.currentTerm,
+		CandidateId: rf.me,
+	}
+	rf.mu.Unlock()
+	votesCount := 1
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go func(i int) {
+				reply := RequestVoteReply{}
+				DPrintf("Raft %d send RequestVote to %d with term %d\n", rf.me, i, args.Term)
+				ok := rf.sendRequestVote(i, &args, &reply)
+				rf.mu.Lock()
+				// 还在当前的Term竞选
+				if ok && rf.currentTerm == args.Term && rf.role == Candidate{
+					if reply.VoteGranted {
+						votesCount++
+						if votesCount > len(rf.peers)/2 {
+							DPrintf("Raft %d receives majority votes in term %d\n", rf.me, rf.currentTerm)
+							rf.becomeLeader()
+						}
+					} else if reply.Term > rf.currentTerm {
+						// 失败的请求可能是遭遇了更高的Term--leader，所以要降级
+						DPrintf("Raft %d finds a leader %d in term %d", rf.me, i, rf.currentTerm)
+						rf.becomeFollower(reply.Term)
+					}
+				}
+				rf.mu.Unlock()
+			}(i)
+		}
+	}
 }

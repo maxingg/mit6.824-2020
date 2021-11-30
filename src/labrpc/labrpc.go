@@ -217,14 +217,15 @@ func (rn *Network) processReq(req reqMsg) {
 	enabled, servername, server, reliable, longreordering := rn.readEndnameInfo(req.endname)
 
 	if enabled && servername != nil && server != nil {
+		// 模拟网络不稳定
 		if reliable == false {
-			// short delay
+			// short delay--低延迟
 			ms := (rand.Int() % 27)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
 		if reliable == false && (rand.Int()%1000) < 100 {
-			// drop the request, return as if timeout
+			// drop the request, return as if timeout--超时
 			req.replyCh <- replyMsg{false, nil}
 			return
 		}
@@ -233,6 +234,7 @@ func (rn *Network) processReq(req reqMsg) {
 		// in a separate thread so that we can periodically check
 		// if the server has been killed and the RPC should get a
 		// failure reply.
+		// 这里开始处理请求
 		ech := make(chan replyMsg)
 		go func() {
 			r := server.dispatch(req)
@@ -242,6 +244,7 @@ func (rn *Network) processReq(req reqMsg) {
 		// wait for handler to return,
 		// but stop waiting if DeleteServer() has been called,
 		// and return an error.
+		// 定时获取响应消息，并判断是否掉线死亡
 		var reply replyMsg
 		replyOK := false
 		serverDead := false
@@ -279,6 +282,7 @@ func (rn *Network) processReq(req reqMsg) {
 			// Russ points out that this timer arrangement will decrease
 			// the number of goroutines, so that the race
 			// detector is less likely to get upset.
+			// 通过等待随机事件实现重排
 			time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
 				atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
 				req.replyCh <- reply
